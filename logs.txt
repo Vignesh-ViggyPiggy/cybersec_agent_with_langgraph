@@ -1,0 +1,5 @@
+Apr 02 14:31:01 dev01 npm[7122]: Installing dependency event-stream
+Apr 02 14:31:03 dev01 node[7131]: postinstall script executed
+Apr 02 14:31:05 dev01 node[7131]: Downloading additional payload
+Apr 02 14:31:08 dev01 kernel: Outbound connection to 185.100.87.12
+Apr 02 14:31:10 dev01 npm[7122]: Installation complete
