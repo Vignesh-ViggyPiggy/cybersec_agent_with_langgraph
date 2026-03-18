@@ -1,0 +1,8 @@
+<attack_vectors>
+    <vector_group>
+        <name>LearningAwareness</name>
+        <vector>DB_Breach</vector>
+        <vector>data_exfiltration</vector>
+        <vector>Network</vector>
+    </vector_group>
+</attack_vectors>

@@ -1,0 +1,4 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<log_tag>
+	<NoOfErrorEntries>0</NoOfErrorEntries>
+</log_tag>

@@ -210,3 +210,7 @@ mcp/
 mcp-no-ssh/
 output.xml
 rv_ioc_lin.xml
+test copy.py
+
+# Generated reports for all customer hierarchy folders
+hierarchies/**/analysis_report_*.md

@@ -1,297 +1,116 @@
 # Cybersecurity Log Analysis Agent with LangGraph
 
-An intelligent automated cybersecurity log analysis system that uses LangGraph workflows and Large Language Models to analyze system logs, identify security threats, gather threat intelligence, and generate comprehensive security reports with actionable recommendations.
+This project is a LangGraph-based cybersecurity analyst that processes Linux log data, classifies incidents using local datasets, enriches context with web search, and generates per-customer reports plus IOC XML outputs.
 
-## Overview
+## What Changed in This Version
 
-This project implements an AI-powered security analyst that automatically:
-- Collects and monitors system logs from remote Linux servers
-- Analyzes logs for security incidents and anomalies
-- Generates contextual search queries for threat intelligence gathering
-- Searches DuckDuckGo for relevant security information
-- Performs comprehensive threat analysis with risk assessment
-- Generates IOC (Indicator of Compromise) vector groups
-- Produces detailed markdown security reports
+- Added customer hierarchy batch processing from `hierarchies/**/logs.txt`.
+- Added dataset-driven incident type routing before threat-intel search.
+- Outputs are now written beside each customer log file.
+- Added optional MCP upload utilities (`mcp_client.py`, `mcp_server.py`).
 
-## Key Features
+## Current Workflow
 
-### 🔍 Automated Log Analysis
-- Fetches logs from remote Linux systems via HTTP API
-- Detects changes and updates only when new log entries appear
-- Analyzes multiple log sources (audit, secure, syslog, etc.)
+The graph in `test.py` runs these nodes:
 
-### 🧠 AI-Powered Threat Detection
-- Uses Ollama's Seneca model for intelligent analysis
-- Identifies attack patterns and security incidents
-- Generates appropriate threat titles and initial assessments
+1. `InitialAnalysisNode`
+2. `InitialSearchFromLogsToDatasetNode`
+3. Conditional route:
+    - `GettingExamplesUsingIncidentTypeNode` when an incident type matches dataset taxonomy
+    - direct to `QuestionFormerNode` when no match
+4. `QuestionFormerNode`
+5. `ContextDeriverFromSearchQueriesUsingDDGNode`
+6. `ExplainerOutputNode`
+7. `IOCVectorGroupAdderNode`
+8. `MarkdownReportGeneratorNode`
 
-### 🌐 Threat Intelligence Gathering
-- Automatically generates 5 targeted search queries per incident
-- Searches DuckDuckGo for relevant security information
-- Correlates external threat intelligence with local findings
+## Project Layout
 
-### 📊 Comprehensive Analysis
-- Provides detailed 800-1000 word technical security analysis
-- Assigns threat levels (Critical/High/Medium/Low)
-- Includes minimum 5 actionable security recommendations
-- Validates output to ensure complete analysis every time
-
-### 🎯 IOC Vector Group Generation
-- Identifies relevant Indicators of Compromise (IOCs)
-- Maps incidents to 15 predefined IOC vectors:
-  - Ram, Disk, Process, banip, Unbinary, MorefilesChanges
-  - DB_Breach, DB_Delete, DB_Modify, Lib, Bin
-  - Malware, Userbreach, Ransom, Honeypot
-- Generates XML format ready for threat intelligence platforms
-
-### 📝 Professional Reports
-- Generates timestamped markdown reports
-- Includes executive summary, logs, analysis, and recommendations
-- Ready-to-use IOC vector groups in XML format
-- Suitable for security team distribution
-
-## Architecture
-
-The system uses a LangGraph workflow with 6 sequential nodes:
-
-```
-┌─────────────────────┐
-│  LogFileUpdater     │ ← Fetches logs from remote server
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  QuestionFormer     │ ← Analyzes logs, generates search queries
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  ContextDeriver     │ ← Searches DuckDuckGo for threat intel
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  ExplainerOutput    │ ← Detailed analysis & recommendations
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  IOCVectorAdder     │ ← Generates IOC vector groups
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  MarkdownGenerator  │ ← Creates final report
-└─────────────────────┘
+```text
+cybersec_agent_with_langgraph/
+   test.py                      # main LangGraph workflow and batch runner
+   datasets_files/              # merged incident datasets used for routing/examples
+   hierarchies/                 # customer folders (e.g., 1/, 2/, ...)
+      <customer>/.../logs.txt    # input log file per customer hierarchy
+   mcp_client.py                # optional uploader client
+   mcp_server.py                # FastMCP server for file upload endpoint
 ```
 
 ## Requirements
 
-### Dependencies
-```
-langchain_ollama
-langchain_core
-pydantic
-langgraph
-duckduckgo-search (ddgs)
-httpx
-python-dotenv
-```
-
-### Prerequisites
 - Python 3.8+
-- Ollama installed with Seneca model
-- Remote log collection server (optional - will use cached logs if unavailable)
+- Ollama running with the model used in `test.py`
+- Internet access for DuckDuckGo enrichment (optional but recommended)
 
-## Installation
+Install dependencies:
 
-1. **Clone the repository:**
-   ```bash
-   git clone <repository-url>
-   cd cybersec_agent_with_langgraph
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install langchain_ollama langchain_core pydantic langgraph duckduckgo-search httpx python-dotenv
-   ```
-
-3. **Install and setup Ollama:**
-   ```bash
-   # Install Ollama from https://ollama.ai
-   ollama pull seneca
-   ```
-
-4. **Configure environment variables:**
-   Create a `.env` file:
-   ```env
-   REMOTE_SERVER_URL=http://192.168.8.14:8000
-   NUM_LINES=10
-   ```
+```bash
+pip install -r requirements.txt
+```
 
 ## Configuration
 
-### Environment Variables
+Create `.env` (optional):
 
-- `REMOTE_SERVER_URL`: URL of the remote log collection server (default: `http://localhost:8000`)
-- `NUM_LINES`: Number of log lines to fetch per file (default: `10`)
+```env
+REMOTE_SERVER_URL=http://localhost:8000
+NUM_LINES=10
+```
 
-### Supported Log Files
-
-The system monitors these Linux log files:
-- `/var/log/audit/audit.log` - Audit system logs
-- `/var/log/secure` - Security/authentication logs (RHEL/CentOS)
-- `/var/log/auth.log` - Authentication logs (Debian/Ubuntu)
-- `/var/log/syslog` - General system logs (Debian/Ubuntu)
-- `/var/log/messages` - General system logs (RHEL/CentOS)
-- `/var/log/kern.log` - Kernel logs
-- `/var/log/cron` - Cron job execution logs
-- Web server logs (Apache/Nginx)
-- Database logs (MySQL/PostgreSQL)
-- `/var/log/fail2ban.log` - Intrusion prevention logs
+Notes:
+- If remote collection is unavailable, workflow logic can still run against local `logs.txt` inputs.
+- Incident taxonomy is loaded from JSON files in `datasets_files/`.
 
 ## Usage
 
-### Basic Execution
+Run the workflow:
 
 ```bash
 python test.py
 ```
 
-### Workflow Execution
+Runtime behavior:
 
-The system automatically:
-1. **Checks for new logs** - Connects to remote server or uses cached logs
-2. **Analyzes logs** - Identifies security incidents
-3. **Generates search queries** - Creates 5 contextual queries
-4. **Gathers intelligence** - Searches DuckDuckGo for threat information
-5. **Performs analysis** - 800+ word detailed security analysis
-6. **Creates IOC vectors** - Maps to predefined indicator types
-7. **Generates report** - Saves markdown report with timestamp
+1. Scans `hierarchies/` recursively for `logs.txt`.
+2. Runs one workflow execution per discovered customer log file.
+3. If no hierarchy logs exist, falls back to root-level `logs.txt`.
 
-### Output
+## Outputs
 
-Each execution produces:
-- **Console output** - Step-by-step progress with summaries
-- **logs.txt** - Cached log data with timestamp
-- **analysis_report_YYYY-MM-DD_HH-MM-SS.md** - Comprehensive security report
+For each processed `logs.txt`, the workflow writes files in the same folder:
 
-### Sample Report Structure
+- `analysis_report_YYYY-MM-DD_HH-MM-SS.md`
+- `vector_group_output.xml`
 
-```markdown
-# Cybersecurity Log Analysis Report
+Example output location:
 
-## Executive Summary
-- Threat Title
-- Threat Level
-- Date Generated
-
-## Original Logs
-[Complete log data]
-
-## Initial Analysis
-[100-200 word assessment]
-
-## Search Queries Generated
-[5 generated queries]
-
-## Threat Intelligence Gathered
-[DuckDuckGo search results per query]
-
-## Detailed Security Analysis
-[800-1000 word comprehensive analysis]
-
-## Recommended Actions
-[Minimum 5 specific actions]
-
-## IOC Vector Group
-[Vector group name and selected IOC vectors in XML format]
-
-## Conclusion
-[Summary and next steps]
+```text
+hierarchies/1/<subtree>/analysis_report_2026-03-18_11-25-30.md
+hierarchies/1/<subtree>/vector_group_output.xml
 ```
 
-## IOC Vector Descriptions
+Git ignore behavior:
+- `hierarchies/**/analysis_report_*.md` is ignored to avoid committing generated reports.
 
-The system selects from 15 IOC vectors:
+## Optional MCP Upload
 
-| Vector | Description |
-|--------|-------------|
-| **Ram** | High CPU/Memory usage, resource exhaustion attacks |
-| **Disk** | Disk space anomalies, excessive I/O |
-| **Process** | Abnormal process behavior, suspicious processes |
-| **banip** | Failed authentication, brute force attacks |
-| **Unbinary** | Unauthorized binary detection |
-| **MorefilesChanges** | Extensive file system modifications |
-| **DB_Breach** | Database breach or unauthorized access |
-| **DB_Delete** | Database deletion activity |
-| **DB_Modify** | Database modification activity |
-| **Lib** | Library file tampering |
-| **Bin** | Binary file tampering |
-| **Malware** | Malware detection |
-| **Userbreach** | User account compromise |
-| **Ransom** | Ransomware indicators |
-| **Honeypot** | Honeypot trigger detection |
+- Start server:
 
-## Validation & Error Handling
-
-The system includes robust validation:
-- **Minimum length requirements** - Ensures detailed_analysis is at least 500 characters
-- **Minimum item requirements** - Guarantees at least 5 recommended actions
-- **Automatic retry** - Regenerates incomplete analysis
-- **Default recommendations** - Adds intelligent defaults if LLM fails
-- **Fallback to cached logs** - Uses local logs if remote server unavailable
-
-## Customization
-
-### Changing the LLM Model
-
-```python
-model = ChatOllama(model="your-model-name")
+```bash
+python mcp_server.py
 ```
 
-### Adjusting Analysis Length
-
-Modify the `min_length` parameter in `ExplainerOutputTemplate`:
-```python
-detailed_analysis: str = Field(..., min_length=800)
-```
-
-### Adding Custom IOC Vectors
-
-Edit the `IOCVectorGroupAdderTemplate` Literal type and add descriptions in the system prompt.
+- Use `mcp_client.py` helpers to upload generated artifacts to the MCP endpoint.
 
 ## Troubleshooting
 
-### "Failed to connect to server"
-- Check if REMOTE_SERVER_URL is correct
-- System will use cached logs.txt if available
+- `No customer hierarchies were found and logs.txt is missing`:
+   Add at least one `logs.txt` under `hierarchies/` or create root `logs.txt`.
+- Empty or weak analysis output:
+   Verify Ollama model availability and internet access for search enrichment.
+- Dataset routing seems off:
+   Check `datasets_files/*.json` contains valid `incident_type` fields.
 
-### "detailed_analysis too short"
-- System automatically retries with simplified prompt
-- Check Ollama service is running
+## Last Updated
 
-### Missing recommended_actions
-- Validation adds default recommendations automatically
-- Verify LLM model is responding correctly
-
-## Future Enhancements
-
-- [ ] Real-time log streaming
-- [ ] Multi-server support
-- [ ] Integration with SIEM platforms
-- [ ] Custom IOC vector definitions
-- [ ] Email/Slack notifications
-- [ ] Historical trend analysis
-- [ ] Machine learning-based anomaly detection
-
-## Contributing
-
-Contributions are welcome! Please submit pull requests or open issues for bugs and feature requests.
-
-## License
-
-[Specify your license here]
-
-## Author
-
-Cybersecurity Log Analysis Agent - Powered by LangGraph, Ollama, and DuckDuckGo
-
----
-
-**Last Updated:** March 2, 2026 
+March 18, 2026
