@@ -11,3 +11,6 @@ ddgs>=9.10.0
 
 # Optional but recommended
 python-dotenv>=1.0.0
+
+# MCP file transfer (mcp_server.py / mcp_client.py / populate_hierarchies.py)
+fastmcp>=2.0.0

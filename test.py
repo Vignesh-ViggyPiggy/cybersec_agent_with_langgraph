@@ -1,9 +1,10 @@
 from typing import Literal, TypedDict, List, NotRequired
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from ddgs import DDGS
+import argparse
 import asyncio
 import os
 import httpx
@@ -13,11 +14,15 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from mcp_client import send_files
+from populate_hierarchies import populate_hierarchies as pull_hierarchy_from_vault
+
+DEFAULT_VAULT_ROOT = "rationalVault/data"
+GENERATED_OUTPUT_FILENAMES = {"logs.txt", "vector_group_output.xml"}
 
 # Load environment variables
 load_dotenv()
 
-model = ChatOllama(model="aaquisher", num_keep=0)
+model = ChatOllama(model="cybersec-qwen25-3b-q4", num_keep=0)
 
 
 def _load_incident_types_from_datasets() -> List[str]:
@@ -134,23 +139,12 @@ class InitialAnalysisTemplate(BaseModel):
     content: str = Field(description="A 100-200 word initial analysis of the attack or potential attack after analyzing the logs")
     
 class InitialSearchFromLogsToDatasetTemplate(BaseModel):
-    incident_type: str = Field(
+    incident_type: Literal[tuple(INCIDENT_TYPES_WITH_FALLBACK)] = Field(
         description=(
             "Incident type label selected from dataset taxonomy. "
-            f"Allowed values: {INCIDENT_TYPES_WITH_FALLBACK_HINT}. "
             f"Use '{NONE_APPLICABLE_INCIDENT_TYPE}' if none match."
         )
     )
-
-    @field_validator("incident_type")
-    @classmethod
-    def validate_incident_type(cls, value: str) -> str:
-        cleaned = str(value).strip()
-        if cleaned not in INCIDENT_TYPES_WITH_FALLBACK_SET:
-            raise ValueError(
-                f"incident_type must be one of: {INCIDENT_TYPES_WITH_FALLBACK_HINT}"
-            )
-        return cleaned
 
 
 class QuestionFormerOutputTemplate(BaseModel):
@@ -1423,10 +1417,95 @@ def _run_workflow_for_logs_file(logs_file: Path, hierarchies_dir: Path | None = 
     return result
 
 
+def _is_generated_output_file(file_path: Path) -> bool:
+    """Identify files this workflow itself writes, so they're excluded when re-consolidating."""
+    name = file_path.name
+    if name in GENERATED_OUTPUT_FILENAMES:
+        return True
+    return name.startswith("analysis_report_") and name.endswith(".md")
+
+
+def _consolidate_hierarchy_files_to_logs(hierarchy_dir: Path) -> Path:
+    """
+    Combine every source file under hierarchy_dir (as pulled by populate_hierarchies.py)
+    into a single hierarchy_dir/logs.txt, one section per file: its name followed by
+    its content. That combined file is what the LangGraph nodes analyze.
+    """
+    logs_path = hierarchy_dir / "logs.txt"
+    sections = []
+
+    for file_path in sorted(hierarchy_dir.rglob("*")):
+        if not file_path.is_file() or _is_generated_output_file(file_path):
+            continue
+
+        relative_name = file_path.relative_to(hierarchy_dir).as_posix()
+        try:
+            content = file_path.read_text(encoding="utf-8").rstrip()
+        except UnicodeDecodeError:
+            content = f"[binary file, {file_path.stat().st_size} bytes - content omitted]"
+
+        sections.append(f"===== {relative_name} =====\n{content}")
+
+    logs_path.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
+    return logs_path
+
+
+def _run_workflow_for_hierarchy(hierarchy: str, vault_root: str, hierarchies_dir: Path) -> dict:
+    """Pull one hierarchy's files via MCP, consolidate them, and analyze just that hierarchy."""
+    print("\n" + "#" * 70)
+    print("# PULLING HIERARCHY FILES VIA MCP")
+    print("#" * 70)
+    print(f"Vault root: {vault_root}")
+    print(f"Hierarchy:  {hierarchy}")
+
+    pull_hierarchy_from_vault(vault_root, hierarchies_dir, hierarchy)
+
+    hierarchy_dir = hierarchies_dir / Path(hierarchy.strip("/\\"))
+    if not hierarchy_dir.exists() or not hierarchy_dir.is_dir():
+        print(f"ERROR: No files found for hierarchy '{hierarchy}' after MCP pull.")
+        raise SystemExit(1)
+
+    print("\n" + "#" * 70)
+    print("# CONSOLIDATING HIERARCHY FILES INTO logs.txt")
+    print("#" * 70)
+    logs_file = _consolidate_hierarchy_files_to_logs(hierarchy_dir)
+    print(f"✓ Combined logs written to {logs_file}")
+
+    return _run_workflow_for_logs_file(logs_file, hierarchies_dir)
+
+
 def main() -> None:
-    """Run the workflow for every customer hierarchy, or fall back to local logs.txt."""
+    """
+    Run the workflow for a single hierarchy pulled via MCP (--hierarchy), or fall back
+    to batch-analyzing every customer hierarchy already present locally, or a root-level
+    logs.txt if neither applies.
+    """
+    parser = argparse.ArgumentParser(description="Run the cybersecurity log analysis workflow.")
+    parser.add_argument(
+        "--hierarchy",
+        default=None,
+        help=(
+            "Specific hierarchy path to analyze, e.g. 5/101/1/4/1 "
+            "(company_id/customer_id/branch_id/product_id/system_id). "
+            "When given, populate_hierarchies.py is run for just this hierarchy, "
+            "its files are consolidated into logs.txt, and only that hierarchy is analyzed "
+            "instead of batch-scanning all of hierarchies/."
+        ),
+    )
+    parser.add_argument(
+        "--vault-root",
+        default=DEFAULT_VAULT_ROOT,
+        help=f"Vault root path on the MCP server to pull --hierarchy from (default: {DEFAULT_VAULT_ROOT}).",
+    )
+    args = parser.parse_args()
+
     base_dir = Path(__file__).parent
     hierarchies_dir = base_dir / "hierarchies"
+
+    if args.hierarchy:
+        _run_workflow_for_hierarchy(args.hierarchy, args.vault_root, hierarchies_dir)
+        return
+
     hierarchy_logs = _discover_customer_log_files(hierarchies_dir)
 
     if hierarchy_logs:

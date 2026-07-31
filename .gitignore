@@ -214,3 +214,6 @@ test copy.py
 
 # Generated reports for all customer hierarchy folders
 hierarchies/**/analysis_report_*.md
+
+# Server-side customer data source (lives only on the MCP server machine)
+rationalVault/
