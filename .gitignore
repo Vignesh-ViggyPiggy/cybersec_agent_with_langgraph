@@ -212,8 +212,13 @@ output.xml
 rv_ioc_lin.xml
 test copy.py
 
-# Generated reports for all customer hierarchy folders
-hierarchies/**/analysis_report_*.md
+# Locally-pulled/generated customer hierarchy data (mirrors rationalVault/
+# below — this can contain real pulled vault data from testing, never commit
+# it). Directory structure itself is kept via .gitkeep. A middle slash makes
+# a gitignore pattern root-anchored, so "**/" is required here to match
+# hierarchies/ wherever it lives (currently analysis_system/hierarchies/).
+**/hierarchies/*
+!**/hierarchies/.gitkeep
 
 # Server-side customer data source (lives only on the MCP server machine)
 rationalVault/

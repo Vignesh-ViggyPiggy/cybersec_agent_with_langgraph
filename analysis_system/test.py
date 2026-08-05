@@ -14,15 +14,25 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from mcp_client import send_files
-from populate_hierarchies import populate_hierarchies as pull_hierarchy_from_vault
+from anomaly_workflow import run_anomaly_detection
 
 DEFAULT_VAULT_ROOT = "rationalVault/data"
-GENERATED_OUTPUT_FILENAMES = {"logs.txt", "vector_group_output.xml"}
 
 # Load environment variables
 load_dotenv()
 
-model = ChatOllama(model="cybersec-qwen25-3b-q4", num_keep=0)
+# Without an explicit request timeout, a stuck/overloaded Ollama call blocks
+# forever with no signal to distinguish "slow" from "hung" — this bounds it so
+# a genuinely stuck call fails with a clear exception instead. Every call site
+# below still has its own try/except degrading to a safe default, so this
+# timeout firing never crashes the workflow, just cuts a bad call short.
+MODEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "120"))
+
+model = ChatOllama(
+    model="cybersec-qwen25-3b-q4",
+    num_keep=0,
+    sync_client_kwargs={"timeout": MODEL_REQUEST_TIMEOUT_SECONDS},
+)
 
 
 def _load_incident_types_from_datasets() -> List[str]:
@@ -141,9 +151,18 @@ class InitialAnalysisTemplate(BaseModel):
 class InitialSearchFromLogsToDatasetTemplate(BaseModel):
     incident_type: Literal[tuple(INCIDENT_TYPES_WITH_FALLBACK)] = Field(
         description=(
-            "Incident type label selected from dataset taxonomy. "
+            "PRIMARY incident type label selected from dataset taxonomy — the single most "
+            "significant/severe distinct attack pattern evidenced in the logs. "
             f"Use '{NONE_APPLICABLE_INCIDENT_TYPE}' if none match."
         )
+    )
+    secondary_incident_types: List[Literal[tuple(INCIDENT_TYPES_WITH_FALLBACK)]] = Field(
+        default_factory=list,
+        description=(
+            "Any OTHER distinct incident types also clearly and explicitly evidenced in the logs, "
+            "besides the primary one. Leave empty if there's only one incident. Never include the "
+            f"primary incident_type again here, and never include '{NONE_APPLICABLE_INCIDENT_TYPE}'."
+        ),
     )
 
 
@@ -154,11 +173,17 @@ class QuestionFormerOutputTemplate(BaseModel):
     search_query_4: str = Field(description="Another search query to find more information about the attack or potential attack")
     search_query_5: str = Field(description="Another search query to find more information about the attack or potential attack")
 
+class SecondaryIncidentTemplate(BaseModel):
+    incident_type: str = Field(description="One of the secondary incident types already classified for this pull")
+    threat_level: Literal["low", "medium", "high", "critical"] = Field(description="Threat level of this specific secondary incident, judged independently of the primary incident")
+    summary: str = Field(description="1-3 sentence summary of what this secondary finding is and why it matters, grounded only in the logs — not the primary incident's narrative")
+
 class ExplainerOutputTemplate(BaseModel):
-    threat_level: Literal["low", "medium", "high", "critical"] = Field(description="The threat level of the attack or potential attack based on the search results")
-    detailed_analysis: str = Field(description="A more detailed analysis of the attack or potential attack based on the search results", min_length=500)
+    threat_level: Literal["low", "medium", "high", "critical"] = Field(description="The threat level of the PRIMARY attack or potential attack based on the search results")
+    detailed_analysis: str = Field(description="A more detailed analysis of the PRIMARY attack or potential attack based on the search results", min_length=500)
     search_results: List[dict] = Field(description="The search results used to derive the detailed analysis")
     recommended_actions: List[str] = Field(description="Recommended actions to mitigate the attack or potential attack based on the detailed analysis", min_length=5)
+    secondary_incidents: List[SecondaryIncidentTemplate] = Field(default_factory=list, description="Brief independent assessment of each secondary incident type, if any were classified")
 
 class IOCVectorGroupAdderTemplate(BaseModel):
     vector_group_name: str = Field(description="The IOC vector group name in camel case format (e.g. 'SuspiciousProcessAndFileChanges'), sourced from dataset when available or inferred from analysis")
@@ -288,7 +313,22 @@ def _dedupe_multiline_text(text: str) -> str:
     return "\n".join(deduped_lines).strip()
 
 
-def _normalize_explainer_payload(payload: dict, search_results: List[dict]) -> dict:
+def _parse_verification_suggestions(logs_text: str) -> List[tuple[str, str]]:
+    """Extract (category, script_path) pairs from anomaly_workflow.py's
+    'Suggested verification scripts' block. Deterministic, from the logs
+    themselves — used so recommended_actions doesn't rely on the model
+    faithfully re-enumerating a potentially long list on its own."""
+    pairs = []
+    for match in re.finditer(
+        r"^\s*(\S+):\s*not confirmed in alertlog\.xml\s*->\s*run\s+(\S+)\s+to verify",
+        logs_text,
+        re.MULTILINE,
+    ):
+        pairs.append((match.group(1), match.group(2)))
+    return pairs
+
+
+def _normalize_explainer_payload(payload: dict, search_results: List[dict], expected_secondary_types: List[str] | None = None, logs_text: str = "") -> dict:
     """Ensure required fields exist and satisfy schema constraints."""
     valid_levels = {"low", "medium", "high", "critical"}
     out = dict(payload or {})
@@ -323,6 +363,33 @@ def _normalize_explainer_payload(payload: dict, search_results: List[dict]) -> d
 
     cleaned_actions = _dedupe_preserve_order(cleaned_actions)
 
+    # Verification-script suggestions are deterministic (parsed straight from
+    # the logs, not a model guess) — a small model reliably under-enumerates
+    # a long list of these (observed: 5 of 9 in testing, with the "run X to
+    # verify Y" phrasing dropped to bare paths), so force one well-formatted
+    # action per (category, script) pair rather than trusting the model to
+    # reproduce them. The SAME script can verify two different categories
+    # (e.g. suspicious_monitor.py covers both ssh_key_injection and
+    # suspicious_command_execution) — checking "is this script path already
+    # mentioned somewhere" would silently drop the second category behind the
+    # first's mention, so instead drop the model's own bare/near-bare mentions
+    # of these paths (they carry no category info to disambiguate) and replace
+    # them wholesale with one explicit, correctly-attributed action per pair.
+    verification_pairs = _parse_verification_suggestions(logs_text)
+    verification_script_paths = {path for _, path in verification_pairs}
+
+    def _is_bare_script_mention(action_text: str) -> bool:
+        stripped = action_text.strip().rstrip(".")
+        return stripped in verification_script_paths
+
+    cleaned_actions = [a for a in cleaned_actions if not _is_bare_script_mention(a)]
+
+    for category, script_path in verification_pairs:
+        cleaned_actions.append(
+            f"Run {script_path} to verify {category} (not yet confirmed in alertlog.xml)."
+        )
+    cleaned_actions = _dedupe_preserve_order(cleaned_actions)
+
     fallback_actions = [
         "Isolate affected hosts and block suspicious source IPs at the network perimeter.",
         "Reset potentially exposed credentials and enforce MFA for privileged and remote access accounts.",
@@ -333,7 +400,41 @@ def _normalize_explainer_payload(payload: dict, search_results: List[dict]) -> d
 
     while len(cleaned_actions) < 5:
         cleaned_actions.append(fallback_actions[len(cleaned_actions)])
-    out["recommended_actions"] = cleaned_actions[:10]
+    out["recommended_actions"] = cleaned_actions[:max(10, len(verification_pairs) + 3)]
+
+    # secondary_incidents: keep only entries whose incident_type was actually
+    # classified as secondary (drop anything invented/hallucinated), fill in
+    # a minimal placeholder for any expected type the model skipped, and
+    # de-dupe by incident_type.
+    expected = expected_secondary_types or []
+    raw_secondary = out.get("secondary_incidents", [])
+    if not isinstance(raw_secondary, list):
+        raw_secondary = []
+
+    cleaned_secondary = {}
+    for entry in raw_secondary:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("incident_type", "")).strip()
+        if entry_type not in expected or entry_type in cleaned_secondary:
+            continue
+        entry_level = str(entry.get("threat_level", "medium")).strip().lower()
+        entry_summary = str(entry.get("summary", "")).strip()
+        cleaned_secondary[entry_type] = {
+            "incident_type": entry_type,
+            "threat_level": entry_level if entry_level in valid_levels else "medium",
+            "summary": entry_summary or f"Rule-based detection flagged {entry_type}; not further elaborated.",
+        }
+
+    for entry_type in expected:
+        if entry_type not in cleaned_secondary:
+            cleaned_secondary[entry_type] = {
+                "incident_type": entry_type,
+                "threat_level": "medium",
+                "summary": f"Rule-based detection flagged {entry_type}; not further elaborated.",
+            }
+
+    out["secondary_incidents"] = [cleaned_secondary[t] for t in expected]
 
     return out
 
@@ -402,6 +503,19 @@ def _normalize_initial_search_payload(payload: dict) -> dict:
     if incident_type not in INCIDENT_TYPES_WITH_FALLBACK_SET:
         incident_type = NONE_APPLICABLE_INCIDENT_TYPE
     out["incident_type"] = incident_type
+
+    raw_secondary = out.get("secondary_incident_types", [])
+    if not isinstance(raw_secondary, list):
+        raw_secondary = []
+    cleaned_secondary = []
+    for item in raw_secondary:
+        candidate = str(item).strip()
+        if (candidate in INCIDENT_TYPES_WITH_FALLBACK_SET
+                and candidate != incident_type
+                and candidate != NONE_APPLICABLE_INCIDENT_TYPE
+                and candidate not in cleaned_secondary):
+            cleaned_secondary.append(candidate)
+    out["secondary_incident_types"] = cleaned_secondary
 
     return out
 
@@ -559,7 +673,8 @@ def InitialAnalysisNode(state: MessageState) -> MessageState:
 
     structured_model = model.with_structured_output(InitialAnalysisTemplate)
     template = ChatPromptTemplate.from_messages([
-        ("system", "You are a cybersecurity analyst. Analyze the logs and provide an appropriate title and a 100-200 word initial analysis. Ignore file-not-found style noise and focus on true security indicators."),
+        ("system", "You are a cybersecurity analyst. Analyze the logs and provide an appropriate title and a 100-200 word initial analysis. Ignore file-not-found style noise and focus on true security indicators. "
+                   "Be literal and precise about what the logs actually say. Do not paraphrase or substitute the name of a system, service, or component with a different one just because other lines nearby mention something similar-sounding — e.g. if the logs say 'logging service is disabled', report that literally; do not describe it as an 'SSH service' outage just because SSH-related lines also happen to appear elsewhere in the same input. If the logs contain multiple distinct findings (e.g. a log-tampering alert and a separate SSH auth-failure count), describe them as separate observations rather than merging them into one narrative that conflates unrelated systems."),
         ("user", "{logs}")
     ])
 
@@ -577,18 +692,25 @@ def InitialAnalysisNode(state: MessageState) -> MessageState:
 - title: string
 - content: string (100-200 words)
 
+Be literal and precise about what the logs actually say — do not paraphrase or substitute the name of a system/service with a different one just because something similar-sounding appears nearby.
+
 Do not include markdown, HTML, comments, or extra text before/after JSON."""),
             ("user", """Analyze the following logs and return strict JSON now:
 {logs}""")
         ])
 
-        raw_response = (fallback_prompt | model).invoke(input_payload)
-        raw_text = getattr(raw_response, "content", "")
-        if isinstance(raw_text, list):
-            raw_text = "\n".join(str(x) for x in raw_text)
-        raw_text = str(raw_text)
+        try:
+            raw_response = (fallback_prompt | model).invoke(input_payload)
+            raw_text = getattr(raw_response, "content", "")
+            if isinstance(raw_text, list):
+                raw_text = "\n".join(str(x) for x in raw_text)
+            raw_text = str(raw_text)
+            parsed = _extract_first_json_object(raw_text)
+        except Exception as fallback_exc:
+            print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
+            print("  ↻ Using safe defaults instead.")
+            parsed = None
 
-        parsed = _extract_first_json_object(raw_text)
         normalized = _normalize_initial_analysis_payload(parsed or {})
         result = InitialAnalysisTemplate.model_validate(normalized)
 
@@ -622,14 +744,56 @@ def InitialSearchFromLogsToDatasetNode(state: MessageState) -> MessageState:
     title = str(prior_result.get("title", "Potential Security Incident"))
     content = str(prior_result.get("content", ""))
 
+    # anomaly_workflow.py tags findings with a rule-based category derived from
+    # which specific check/script produced them (e.g. rootkitscan.txt ->
+    # rootkit_detected) and writes it as a header line. When present, that's a
+    # deterministic signal, not a guess — treat it as a strong prior instead of
+    # classifying from raw text alone.
+    suggested_match = re.search(
+        r"Suggested incident_type \(rule-based, from detection source\):\s*(\S+)",
+        state["logs"],
+    )
+    suggested_hint = suggested_match.group(1) if suggested_match else None
+
+    secondary_match = re.search(
+        r"Additional suggested incident_types \(secondary, rule-based, from detection source\):\s*(.+)",
+        state["logs"],
+    )
+    secondary_hints = (
+        [h.strip() for h in secondary_match.group(1).split(",") if h.strip()]
+        if secondary_match else []
+    )
+    secondary_hint_instruction = (
+        f"\nThe input also contains rule-based secondary suggestions: {secondary_hints}. "
+        f"These are separate, distinct findings from the primary one — include each in "
+        f"secondary_incident_types unless the logs clearly show that finding doesn't actually apply."
+        if secondary_hints else ""
+    )
+
+    hint_instruction = (
+        f"\nThe input also contains a rule-based suggestion: '{suggested_hint}'. "
+        f"This came from deterministic detection logic (not a guess) — treat it as the correct answer for "
+        f"incident_type (the PRIMARY incident). "
+        f"Only override it if the logs contain EXPLICIT, unambiguous evidence of a different specific "
+        f"attack pattern actually occurring (e.g. an actual new key added to authorized_keys, not merely "
+        f"the word 'SSH' or a related term appearing somewhere in the input). A different finding that is "
+        f"merely adjacent or superficially similar-sounding — including one described in the initial "
+        f"analysis text above — is NOT sufficient grounds to override the suggestion; that other finding "
+        f"may itself be a separate, lower-priority observation rather than the primary incident."
+        f"{secondary_hint_instruction}"
+        if suggested_hint else secondary_hint_instruction
+    )
+
     incident_type_template = ChatPromptTemplate.from_messages([
         ("system", f"""You are a cybersecurity analyst.
 Using the existing initial analysis and logs, return:
-- incident_type (string)
+- incident_type (string) — the single PRIMARY incident
+- secondary_incident_types (list of strings) — any OTHER distinct incidents also clearly evidenced, or an empty list if there's only one
 
 incident_type must be exactly one of: {INCIDENT_TYPES_WITH_FALLBACK_HINT}
 Use '{NONE_APPLICABLE_INCIDENT_TYPE}' if none of the listed types are applicable.
-Ignore file-not-found style noise and focus on true security indicators."""),
+secondary_incident_types must each also be one of the listed types, must never repeat the primary incident_type, and must never contain '{NONE_APPLICABLE_INCIDENT_TYPE}'.
+Ignore file-not-found style noise and focus on true security indicators.{hint_instruction}"""),
         ("user", """Logs:
 {logs}
 
@@ -643,6 +807,8 @@ Content: {content}""")
 
     try:
         incident_type_result = incident_type_chain.invoke(input_payload)
+        normalized = _normalize_initial_search_payload(incident_type_result.model_dump())
+        incident_type_result = InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
     except Exception as e:
         print(f"  ⚠ Structured output parsing failed: {e}")
         print("  ↻ Retrying incident type classification with strict JSON fallback...")
@@ -650,9 +816,11 @@ Content: {content}""")
         fallback_prompt = ChatPromptTemplate.from_messages([
             ("system", f"""Return ONLY valid JSON with these exact keys:
 - incident_type: string (must be one of: {INCIDENT_TYPES_WITH_FALLBACK_HINT})
+- secondary_incident_types: array of strings (each must also be one of the listed types; empty array if only one incident)
 
 If no listed type applies, set incident_type to '{NONE_APPLICABLE_INCIDENT_TYPE}'.
-Do not include markdown, HTML, comments, or extra text before/after JSON."""),
+secondary_incident_types must never repeat incident_type and must never contain '{NONE_APPLICABLE_INCIDENT_TYPE}'.
+Do not include markdown, HTML, comments, or extra text before/after JSON.{hint_instruction}"""),
                 ("user", """Analyze the following logs and initial analysis and return strict JSON now:
 
         Logs:
@@ -663,17 +831,38 @@ Do not include markdown, HTML, comments, or extra text before/after JSON."""),
         Content: {content}""")
         ])
 
-        raw_response = (fallback_prompt | model).invoke(input_payload)
-        raw_text = getattr(raw_response, "content", "")
-        if isinstance(raw_text, list):
-            raw_text = "\n".join(str(x) for x in raw_text)
-        raw_text = str(raw_text)
+        try:
+            raw_response = (fallback_prompt | model).invoke(input_payload)
+            raw_text = getattr(raw_response, "content", "")
+            if isinstance(raw_text, list):
+                raw_text = "\n".join(str(x) for x in raw_text)
+            raw_text = str(raw_text)
+            parsed = _extract_first_json_object(raw_text)
+        except Exception as fallback_exc:
+            print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
+            print("  ↻ Using safe defaults instead.")
+            parsed = None
 
-        parsed = _extract_first_json_object(raw_text)
         normalized = _normalize_initial_search_payload(parsed or {})
         incident_type_result = InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
 
+    # The rule-based secondary hints are deterministic detection output, not a
+    # guess — a small model reliably under-enumerates long lists (observed:
+    # 1 of 8 actual secondary hints classified in testing), so merge all of
+    # them in rather than trusting the model to faithfully reproduce the list.
+    # The model's own picks (if any went beyond the hints) are kept too.
+    merged_secondary = list(incident_type_result.secondary_incident_types)
+    for hint in secondary_hints:
+        if (hint in INCIDENT_TYPES_WITH_FALLBACK_SET
+                and hint != incident_type_result.incident_type
+                and hint not in merged_secondary):
+            merged_secondary.append(hint)
+    if merged_secondary != incident_type_result.secondary_incident_types:
+        incident_type_result = incident_type_result.model_copy(update={"secondary_incident_types": merged_secondary})
+
     print(f"✓ Initial incident type: {incident_type_result.incident_type}")
+    if incident_type_result.secondary_incident_types:
+        print(f"✓ Secondary incident types: {incident_type_result.secondary_incident_types}")
 
     print("\n" + "-"*70)
     print("NODE OUTPUT:")
@@ -727,6 +916,17 @@ def GettingExamplesUsingIncidentTypeNode(state: MessageState) -> MessageState:
     print(f"✓ Incident type used for dataset search: {incident_type}")
     print(f"✓ Matching dataset examples found: {len(examples)}")
 
+    # Secondary incidents get a small number of examples each (not the full
+    # match count like the primary) — just enough for the explainer to ground
+    # a brief independent assessment, not a full narrative treatment.
+    secondary_types = prior_result.get("secondary_incident_types", []) or []
+    secondary_dataset_examples = {}
+    for sec_type in secondary_types:
+        sec_examples = _load_examples_for_incident_type(sec_type)
+        if sec_examples:
+            secondary_dataset_examples[sec_type] = sec_examples[:2]
+    prior_result["secondary_dataset_examples"] = secondary_dataset_examples
+
     print("\n" + "-"*70)
     print("NODE OUTPUT:")
     print("-"*70)
@@ -741,6 +941,10 @@ def GettingExamplesUsingIncidentTypeNode(state: MessageState) -> MessageState:
 
     if len(examples) > 3:
         print(f"  ... and {len(examples) - 3} more examples")
+
+    if secondary_dataset_examples:
+        print(f"Secondary incident examples: "
+              f"{ {k: len(v) for k, v in secondary_dataset_examples.items()} }")
 
     return {
         **_carry_context(state),
@@ -766,9 +970,30 @@ def QuestionFormerNode(state: MessageState) -> MessageState:
     prior_result = state.get("result", {})
     title = prior_result.get("title", "Potential Security Incident")
     content = prior_result.get("content", "")
-    
+    incident_type = str(prior_result.get("incident_type", "")).strip()
+    incident_type_hint = (
+        f" The incident has already been classified as '{incident_type}' — let that guide which "
+        f"general concept each query targets."
+        if incident_type and incident_type != NONE_APPLICABLE_INCIDENT_TYPE else ""
+    )
+
     template = ChatPromptTemplate.from_messages([
-        ("system", "You are a cybersecurity analyst. Based on the logs and the existing initial analysis, generate 5 search queries to find more information about the attack or potential attack. Ignore the logs that states file does not exist or cannot be found. Focus on the logs that indicate potential security incidents."),
+        ("system", "You are a cybersecurity analyst. Based on the logs and the existing initial analysis, "
+                   "generate 5 search queries to find more information about the attack or potential attack. "
+                   "Ignore the logs that states file does not exist or cannot be found. Focus on the logs that "
+                   "indicate potential security incidents.\n\n"
+                   "IMPORTANT: Phrase each query around the general security technique or concept actually "
+                   "described in THESE logs and THIS initial analysis (e.g. if the logs describe a disabled "
+                   "logging service, a query like 'log tampering detection techniques' is appropriate; if they "
+                   "describe repeated failed SSH logins, 'SSH brute force detection' is appropriate) — do not "
+                   "use internal or proprietary system field names, product names, or file paths specific to "
+                   "this environment, those won't return useful public results.\n\n"
+                   "The examples just given (log tampering, SSH brute force) illustrate PHRASING STYLE ONLY. "
+                   "Do not reuse those specific topics, or any other example topic like SSH key injection, "
+                   "rootkits, ransomware decoys, or privilege escalation, unless the logs or initial analysis "
+                   "actually describe that specific attack type occurring. Every query must be traceable to "
+                   "something the logs or initial analysis actually say — not a plausible-sounding attack that "
+                   "merely shares a keyword with them." + incident_type_hint),
         ("user", """Logs:
 {logs}
 
@@ -793,6 +1018,11 @@ Content: {content}""")
 - search_query_4: string
 - search_query_5: string
 
+Phrase each query around the general security technique or concept actually described in the logs and
+initial analysis below — not around internal or proprietary system field names, product names, or file
+paths specific to this environment, and not around an unrelated attack type just because it shares a
+keyword. Every query must be traceable to something the logs or initial analysis actually say.
+
 Do not include markdown, HTML, comments, or extra text before/after JSON."""),
             ("user", """Based on these logs and the existing initial analysis, return strict JSON now:
 
@@ -804,13 +1034,18 @@ Title: {title}
 Content: {content}""")
         ])
 
-        raw_response = (fallback_prompt | model).invoke(input_payload)
-        raw_text = getattr(raw_response, "content", "")
-        if isinstance(raw_text, list):
-            raw_text = "\n".join(str(x) for x in raw_text)
-        raw_text = str(raw_text)
+        try:
+            raw_response = (fallback_prompt | model).invoke(input_payload)
+            raw_text = getattr(raw_response, "content", "")
+            if isinstance(raw_text, list):
+                raw_text = "\n".join(str(x) for x in raw_text)
+            raw_text = str(raw_text)
+            parsed = _extract_first_json_object(raw_text)
+        except Exception as fallback_exc:
+            print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
+            print("  ↻ Using safe defaults instead.")
+            parsed = None
 
-        parsed = _extract_first_json_object(raw_text)
         normalized = _normalize_question_former_payload(parsed or {}, state["logs"])
         result = QuestionFormerOutputTemplate.model_validate(normalized)
     
@@ -939,7 +1174,22 @@ def ExplainerOutputNode(state: MessageState) -> MessageState:
     structured_model = model.with_structured_output(ExplainerOutputTemplate)
     dataset_examples = state.get("result", {}).get("dataset_examples", [])
     reference_examples = _build_explainer_reference_examples(dataset_examples)
-    
+
+    secondary_incident_types = state.get("result", {}).get("secondary_incident_types", []) or []
+    secondary_dataset_examples = state.get("result", {}).get("secondary_dataset_examples", {}) or {}
+    if secondary_incident_types:
+        secondary_lines = [f"Secondary incidents also classified for this pull: {secondary_incident_types}"]
+        for sec_type in secondary_incident_types:
+            sec_examples = secondary_dataset_examples.get(sec_type, [])
+            if sec_examples:
+                desc = str(sec_examples[0].get("description", "")).strip()[:200]
+                secondary_lines.append(f"- {sec_type}: reference pattern — {desc}" if desc else f"- {sec_type}")
+            else:
+                secondary_lines.append(f"- {sec_type}: no dataset reference example available")
+        secondary_context = "\n".join(secondary_lines)
+    else:
+        secondary_context = "No secondary incidents were classified for this pull."
+
     # Format search results for the LLM
     search_context = "\n\n".join([
         f"Query {sr.get('query_number')}: {sr.get('query')}\n"
@@ -959,11 +1209,22 @@ def ExplainerOutputNode(state: MessageState) -> MessageState:
 
 Use the reference incident examples as archetypes for how incidents are described and reasoned about. Infer what happened in the current logs and explain it in a dataset-like narrative style, while staying grounded in the logs and search intelligence.
 
+The search results are general background intelligence about how an attack technique of this kind typically works — they are NOT a report of what was observed on this specific system. Never phrase something from a search result as if it was directly observed in these logs (e.g. do not write "the observed SSH key injection..." unless the logs themselves show a key was actually injected). If a search result describes a different, unrelated attack technique that happens to share a keyword with a query, do not fold it into the incident narrative at all — only use search results that are genuinely relevant to what these logs actually show.
+
+Calibrate threat_level against these criteria — do not default to High/Critical just because the topic is security-related; most individual findings, especially single low-confidence indicators, should be Low or Medium:
+- LOW: a single low-confidence or easily-explained indicator (e.g. one failed login, a minor config drift) with no evidence of actual compromise or ongoing malicious activity.
+- MEDIUM: suspicious activity with real supporting evidence, but not confirmed compromise, or a single moderate-severity finding (e.g. a handful of failed logins from one source, a modified file with unclear cause).
+- HIGH: multiple corroborating findings, or a single finding with strong evidence of actual unauthorized access or tampering, but contained/limited in scope (e.g. a confirmed new SSH key injected, a confirmed unrecognized binary running).
+- CRITICAL: confirmed active compromise with severe or business-critical impact (e.g. active ransomware encryption, confirmed data exfiltration, root-level backdoor in active use). Reserve this for cases the evidence clearly supports — do not use it as a default.
+
 Based on the initial analysis, reference examples, and threat intelligence from search results, provide:
-1. A threat level (Critical/High/Medium/Low)
-2. A comprehensive detailed analysis (300-500 words) explaining what happened, likely attack progression, implications, and technical details from the search results
+1. A threat level (Critical/High/Medium/Low) for the PRIMARY incident only, using the calibration above
+2. A comprehensive detailed analysis (300-500 words) explaining what happened, likely attack progression, implications, and technical details from the search results — about the PRIMARY incident only
 3. The search results used in your analysis
 4. A list of recommended actions to mitigate the threat
+5. secondary_incidents: if any secondary incidents are listed below, provide ONE brief independent assessment per secondary incident type — its own threat_level (using the same calibration above, judged on its own merits, not inherited from the primary incident) and a 1-3 sentence summary grounded only in what the logs show for that specific finding. Do not blend a secondary incident's details into the primary incident's detailed_analysis, and do not invent a secondary incident that isn't listed below.
+
+If the logs contain a line starting with "Suggested verification scripts" listing findings not yet confirmed in alertlog.xml, each such line already names the exact category and exact script path to run (format: "category: not confirmed in alertlog.xml -> run <script path> to verify"). For each such line present, add exactly one recommended action instructing the operator to run that exact script path (copy the path verbatim from the log line, do not invent or genericize it), with a brief note on why it's still unconfirmed. Do not add any additional generic recommendation about "running verification scripts" beyond these specific ones — if there are two such lines, add exactly two matching recommendations, not three.
 
 Be specific, technical, and actionable in your recommendations. Do not copy example text verbatim; adapt the patterns to this case."""),
         ("user", """Original Logs:
@@ -976,24 +1237,28 @@ Content: {content}
 Reference Incident Examples (for reasoning style):
 {reference_examples}
 
+Secondary Incidents (assess each independently, do not merge into the primary narrative):
+{secondary_context}
+
 Threat Intelligence from Search Results:
 {search_context}
 
 Provide your detailed security analysis.""")
     ])
-    
+
     input_payload = {
         "logs": state["logs"],
         "title": state["result"].get("title", ""),
         "content": state["result"].get("content", ""),
         "reference_examples": reference_examples,
+        "secondary_context": secondary_context,
         "search_context": search_context
     }
 
     chain = template | structured_model
     try:
         result = chain.invoke(input_payload)
-        normalized = _normalize_explainer_payload(result.model_dump(), state["search_results"])
+        normalized = _normalize_explainer_payload(result.model_dump(), state["search_results"], secondary_incident_types, state["logs"])
         result = ExplainerOutputTemplate.model_validate(normalized)
     except Exception as e:
         print(f"  ⚠ Structured output parsing failed: {e}")
@@ -1005,6 +1270,17 @@ Provide your detailed security analysis.""")
 - detailed_analysis: string, minimum 500 characters
 - search_results: array of objects
 - recommended_actions: array of at least 5 action strings
+- secondary_incidents: array of objects, each with incident_type, threat_level, summary — one per secondary incident listed below, empty array if none
+
+Calibrate threat_level (both the top-level one and each secondary incident's) against these criteria — do not default to high/critical just because the topic is security-related:
+- low: a single low-confidence or easily-explained indicator, no evidence of actual compromise.
+- medium: suspicious activity with real supporting evidence, but not confirmed compromise.
+- high: multiple corroborating findings, or strong evidence of actual unauthorized access/tampering, contained in scope.
+- critical: confirmed active compromise with severe/business-critical impact — reserve for cases the evidence clearly supports, not a default.
+
+Search results are general background intelligence, not a report of what happened on this system — do not describe something from a search result as directly observed unless the logs themselves show it.
+
+For each "Suggested verification scripts" line in the logs, add exactly one recommended_action naming that exact script path verbatim (do not invent, genericize, or add an extra recommendation beyond the specific ones listed).
 
 Do not include markdown, HTML, comments, or extra text before/after JSON."""),
             ("user", """Original Logs:
@@ -1017,20 +1293,28 @@ Content: {content}
 Reference Incident Examples (for reasoning style):
 {reference_examples}
 
+Secondary Incidents (assess each independently, do not merge into the primary narrative):
+{secondary_context}
+
 Threat Intelligence from Search Results:
 {search_context}
 
 Produce strict JSON now.""")
         ])
 
-        raw_response = (fallback_prompt | model).invoke(input_payload)
-        raw_text = getattr(raw_response, "content", "")
-        if isinstance(raw_text, list):
-            raw_text = "\n".join(str(x) for x in raw_text)
-        raw_text = str(raw_text)
+        try:
+            raw_response = (fallback_prompt | model).invoke(input_payload)
+            raw_text = getattr(raw_response, "content", "")
+            if isinstance(raw_text, list):
+                raw_text = "\n".join(str(x) for x in raw_text)
+            raw_text = str(raw_text)
+            parsed = _extract_first_json_object(raw_text)
+        except Exception as fallback_exc:
+            print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
+            print("  ↻ Using safe defaults instead.")
+            parsed = None
 
-        parsed = _extract_first_json_object(raw_text)
-        normalized = _normalize_explainer_payload(parsed or {}, state["search_results"])
+        normalized = _normalize_explainer_payload(parsed or {}, state["search_results"], secondary_incident_types, state["logs"])
         result = ExplainerOutputTemplate.model_validate(normalized)
     
     print(f"✓ Analysis complete - Threat Level: {result.threat_level}")
@@ -1050,6 +1334,10 @@ Produce strict JSON now.""")
     print(f"\nRECOMMENDED ACTIONS:")
     for i, action in enumerate(result.recommended_actions, 1):
         print(f"  {i}. {action}")
+    if result.secondary_incidents:
+        print(f"\nSECONDARY INCIDENTS:")
+        for sec in result.secondary_incidents:
+            print(f"  - {sec.incident_type} [{sec.threat_level}]: {sec.summary}")
     print("\nDATASET-STYLE INCIDENT SUMMARY:")
     print(dataset_style_summary)
     
@@ -1078,9 +1366,17 @@ def IOCVectorGroupAdderNode(state: MessageState) -> MessageState:
     result = state["result"]
 
     dataset_examples = result.get("dataset_examples", []) if isinstance(result, dict) else []
+    secondary_dataset_examples = result.get("secondary_dataset_examples", {}) if isinstance(result, dict) else {}
+    # Merge in a couple of examples per secondary incident so its vectors are
+    # represented in the group too, without letting them dominate the primary's.
+    combined_examples = list(dataset_examples) if isinstance(dataset_examples, list) else []
+    if isinstance(secondary_dataset_examples, dict):
+        for sec_examples in secondary_dataset_examples.values():
+            combined_examples.extend(sec_examples[:2])
+
     derived_payload = None
-    if isinstance(dataset_examples, list) and dataset_examples:
-        derived_payload = _derive_ioc_from_dataset_examples(dataset_examples)
+    if combined_examples:
+        derived_payload = _derive_ioc_from_dataset_examples(combined_examples)
 
     if derived_payload:
         print("  Using vectors derived from dataset examples...")
@@ -1108,11 +1404,20 @@ Based on this analysis, generate an IOC vector group with:
         ])
 
         chain = template | structured_model
-        ioc_result = chain.invoke({
-            "title": result.get("title", ""),
-            "threat_level": explainer.get("threat_level", ""),
-            "detailed_analysis": explainer.get("detailed_analysis", "")
-        })
+        try:
+            ioc_result = chain.invoke({
+                "title": result.get("title", ""),
+                "threat_level": explainer.get("threat_level", ""),
+                "detailed_analysis": explainer.get("detailed_analysis", "")
+            })
+        except Exception as ioc_exc:
+            print(f"  ⚠ IOC inference failed/timed out: {ioc_exc}")
+            print("  ↻ Using a generic fallback IOC vector group.")
+            fallback_name = _to_camel_case(result.get("title", "")) or "SecurityIncident"
+            ioc_result = IOCVectorGroupAdderTemplate.model_validate({
+                "vector_group_name": fallback_name,
+                "vectors": ["SecurityIncident"],
+            })
     
     print(f"✓ Generated vector group: {ioc_result.vector_group_name}")
     print(f"✓ Selected {len(ioc_result.vectors)} IOC vectors")
@@ -1157,6 +1462,28 @@ Based on this analysis, generate an IOC vector group with:
         "xml_output_path": str(xml_output_path),
     }
 
+def _build_logs_section(logs_text: str, preview_lines: int = 40) -> str:
+    """
+    Render the logs as a short preview with the full content collapsed behind
+    a <details> block (standard GitHub-flavored Markdown, renders natively in
+    GitHub, GitLab, VS Code, etc.), so the report stays scannable without
+    dropping the raw data — click to expand for the full logs.
+    """
+    lines = logs_text.splitlines()
+    if len(lines) <= preview_lines:
+        return f"## Original Logs\n\n```\n{logs_text}\n```"
+
+    preview = "\n".join(lines[:preview_lines])
+    return (
+        f"## Original Logs\n\n"
+        f"Showing first {preview_lines} of {len(lines)} lines — expand below for the full content.\n\n"
+        f"```\n{preview}\n...\n```\n\n"
+        f"<details>\n<summary>Show full logs ({len(lines)} lines)</summary>\n\n"
+        f"```\n{logs_text}\n```\n\n"
+        f"</details>"
+    )
+
+
 def MarkdownReportGeneratorNode(state: MessageState) -> MessageState:
     """
     Docstring for MarkdownReportGeneratorNode
@@ -1174,9 +1501,12 @@ def MarkdownReportGeneratorNode(state: MessageState) -> MessageState:
     explainer = state["explainer_output"]
     search_results = state["search_results"]
     incident_type = result.get("incident_type", "N/A")
+    secondary_incident_types = result.get("secondary_incident_types", []) or []
+    secondary_incidents = explainer.get("secondary_incidents", []) or []
     dataset_examples = result.get("dataset_examples", [])
     used_dataset_examples = isinstance(dataset_examples, list) and len(dataset_examples) > 0
-    
+    logs_section = _build_logs_section(state["logs"])
+
     # Generate markdown content
     markdown_content = f"""# Cybersecurity Log Analysis Report
 
@@ -1186,7 +1516,7 @@ def MarkdownReportGeneratorNode(state: MessageState) -> MessageState:
 
 **Threat Title:** {result.get('title', 'N/A')}
 
-**Incident Type:** {incident_type}
+**Incident Type:** {incident_type}{f" (+ {len(secondary_incident_types)} secondary)" if secondary_incident_types else ""}
 
 **Threat Level:** {explainer.get('threat_level', 'N/A').upper()}
 
@@ -1196,11 +1526,7 @@ def MarkdownReportGeneratorNode(state: MessageState) -> MessageState:
 
 ---
 
-## Original Logs
-
-```
-{state['logs']}
-```
+{logs_section}
 
 ---
 
@@ -1267,6 +1593,19 @@ def MarkdownReportGeneratorNode(state: MessageState) -> MessageState:
     
     markdown_content += "---\n\n## Detailed Security Analysis\n\n"
     markdown_content += explainer.get('detailed_analysis', 'N/A')
+
+    if secondary_incidents:
+        markdown_content += "\n\n---\n\n## Secondary Findings\n\n"
+        markdown_content += (
+            "Additional distinct incident types were also detected in this pull, alongside the "
+            "primary incident above. Each is assessed independently — its threat level is judged "
+            "on its own merits, not inherited from the primary incident.\n\n"
+        )
+        for sec in secondary_incidents:
+            sec_type = sec.get("incident_type", "N/A")
+            sec_level = str(sec.get("threat_level", "N/A")).upper()
+            sec_summary = sec.get("summary", "N/A")
+            markdown_content += f"### {sec_type} — {sec_level}\n\n{sec_summary}\n\n"
 
     markdown_content += "\n\n---\n\n## Dataset-Style Incident Summary\n\n"
     markdown_content += "```\n"
@@ -1386,6 +1725,71 @@ workflow.add_edge("markdown_generator", END)
 # Compile the graph
 app = workflow.compile()
 
+# Written verbatim by anomaly_workflow.py's run_anomaly_detection() when Pass 1
+# + Pass 2 found nothing. Detecting this lets us skip the LLM pipeline entirely
+# instead of asking a model to write a 300-500 word "detailed analysis" of an
+# attack that doesn't exist — which it will do, by inventing one (observed:
+# fabricated "Git Pull Request"/"git operation attack" incidents from this
+# exact input in testing).
+CLEAN_RUN_MARKER = "No anomalous or notable findings detected in this pull."
+
+
+def _write_clean_run_report(logs_content: str, logs_file: Path) -> dict:
+    """Short-circuit path for a clean pull — skip the LangGraph pipeline
+    entirely and write a minimal, honest report directly."""
+    output_dir = logs_file.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    output_path = output_dir / f"analysis_report_{timestamp}.md"
+
+    markdown_content = f"""# Cybersecurity Log Analysis Report
+
+---
+
+## Executive Summary
+
+**Threat Title:** No Anomalies Detected
+
+**Incident Type:** {NONE_APPLICABLE_INCIDENT_TYPE}
+
+**Threat Level:** LOW
+
+**Date Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## Original Logs
+
+```
+{logs_content}
+```
+
+---
+
+## Summary
+
+The rule-based anomaly detection pass (Pass 1 known-verdict extraction + Pass 2 independent surfacing) found no anomalous or notable findings for this hierarchy on this pull. No incident classification, threat intelligence search, or IOC generation was performed — there was nothing to analyze, so none was attempted, rather than having a model invent a plausible-sounding but fabricated incident from essentially empty input.
+
+---
+
+## Conclusion
+
+System appears clean for this pull. Routine monitoring should continue; this report does not require operator action.
+"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(markdown_content)
+
+    print(f"✓ Clean run detected — skipped LLM pipeline, wrote minimal report: {output_path}")
+
+    return {
+        "report_path": str(output_path),
+        "xml_output_path": None,
+        "result": {"incident_type": NONE_APPLICABLE_INCIDENT_TYPE, "title": "No Anomalies Detected"},
+        "explainer_output": {"threat_level": "low"},
+    }
+
+
 def _run_workflow_for_logs_file(logs_file: Path, hierarchies_dir: Path | None = None) -> dict:
     """Run the workflow for one logs.txt file and persist outputs beside it."""
     with open(logs_file, "r", encoding="utf-8") as f:
@@ -1393,6 +1797,13 @@ def _run_workflow_for_logs_file(logs_file: Path, hierarchies_dir: Path | None = 
 
     customer_ids = _extract_customer_ids(logs_file, hierarchies_dir) if hierarchies_dir else []
     customer_label = _format_customer_label(customer_ids)
+
+    if CLEAN_RUN_MARKER in logs_content:
+        print("\n" + "#" * 70)
+        print("# CLEAN RUN — no findings, skipping LLM pipeline")
+        print("#" * 70)
+        print(f"# Customer IDs: {customer_label}")
+        return _write_clean_run_report(logs_content, logs_file)
 
     print("\n" + "#" * 70)
     print("# CYBERSECURITY LOG ANALYSIS WORKFLOW")
@@ -1417,59 +1828,18 @@ def _run_workflow_for_logs_file(logs_file: Path, hierarchies_dir: Path | None = 
     return result
 
 
-def _is_generated_output_file(file_path: Path) -> bool:
-    """Identify files this workflow itself writes, so they're excluded when re-consolidating."""
-    name = file_path.name
-    if name in GENERATED_OUTPUT_FILENAMES:
-        return True
-    return name.startswith("analysis_report_") and name.endswith(".md")
-
-
-def _consolidate_hierarchy_files_to_logs(hierarchy_dir: Path) -> Path:
-    """
-    Combine every source file under hierarchy_dir (as pulled by populate_hierarchies.py)
-    into a single hierarchy_dir/logs.txt, one section per file: its name followed by
-    its content. That combined file is what the LangGraph nodes analyze.
-    """
-    logs_path = hierarchy_dir / "logs.txt"
-    sections = []
-
-    for file_path in sorted(hierarchy_dir.rglob("*")):
-        if not file_path.is_file() or _is_generated_output_file(file_path):
-            continue
-
-        relative_name = file_path.relative_to(hierarchy_dir).as_posix()
-        try:
-            content = file_path.read_text(encoding="utf-8").rstrip()
-        except UnicodeDecodeError:
-            content = f"[binary file, {file_path.stat().st_size} bytes - content omitted]"
-
-        sections.append(f"===== {relative_name} =====\n{content}")
-
-    logs_path.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
-    return logs_path
-
-
 def _run_workflow_for_hierarchy(hierarchy: str, vault_root: str, hierarchies_dir: Path) -> dict:
-    """Pull one hierarchy's files via MCP, consolidate them, and analyze just that hierarchy."""
+    """Pull one hierarchy's files via MCP, run them through anomaly detection
+    (known-verdict extraction + independent anomaly surfacing), and analyze
+    just that hierarchy against the resulting findings."""
     print("\n" + "#" * 70)
-    print("# PULLING HIERARCHY FILES VIA MCP")
+    print("# RUNNING ANOMALY DETECTION (pull + Pass 1 known findings + Pass 2 anomaly surfacing)")
     print("#" * 70)
     print(f"Vault root: {vault_root}")
     print(f"Hierarchy:  {hierarchy}")
 
-    pull_hierarchy_from_vault(vault_root, hierarchies_dir, hierarchy)
-
-    hierarchy_dir = hierarchies_dir / Path(hierarchy.strip("/\\"))
-    if not hierarchy_dir.exists() or not hierarchy_dir.is_dir():
-        print(f"ERROR: No files found for hierarchy '{hierarchy}' after MCP pull.")
-        raise SystemExit(1)
-
-    print("\n" + "#" * 70)
-    print("# CONSOLIDATING HIERARCHY FILES INTO logs.txt")
-    print("#" * 70)
-    logs_file = _consolidate_hierarchy_files_to_logs(hierarchy_dir)
-    print(f"✓ Combined logs written to {logs_file}")
+    logs_file = run_anomaly_detection(hierarchy, vault_root, hierarchies_dir)
+    print(f"✓ Anomaly findings written to {logs_file}")
 
     return _run_workflow_for_logs_file(logs_file, hierarchies_dir)
 

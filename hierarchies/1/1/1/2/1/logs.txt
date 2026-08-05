@@ -1,3 +1,0 @@
-2026-03-15T10:42:11Z WEB01 nginx_access: 192.168.34.55 - - "GET /login?username=admin' OR '1'='1&password=test HTTP/1.1" 200 532 "-" "Mozilla/5.0"
-2026-03-15T10:42:14Z WEB01 nginx_access: 192.168.34.55 - - "GET /search?q=test'; DROP TABLE users;-- HTTP/1.1" 500 742 "-" "Mozilla/5.0"
-2026-03-15T10:42:18Z WEB01 nginx_access: 192.168.34.55 - - "GET /user?id=1234' OR '1'='1 HTTP/1.1" 200 1340 "-" "Mozilla/5.0"

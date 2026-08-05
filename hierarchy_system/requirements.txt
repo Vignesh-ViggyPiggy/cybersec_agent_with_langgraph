@@ -1,0 +1,7 @@
+# Vault-side dependencies only — this machine hosts rationalVault/data and
+# runs mcp_server.py (serves file reads/writes to the analysis machine) plus
+# trigger_mcp_client.py (manually asks the analysis machine to run analysis).
+# It never runs the LangGraph pipeline itself, so none of those deps belong here.
+
+fastmcp>=2.0.0
+python-dotenv>=1.0.0
