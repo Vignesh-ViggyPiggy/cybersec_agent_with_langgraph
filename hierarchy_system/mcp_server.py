@@ -1,11 +1,23 @@
 from fastmcp import FastMCP
 from pathlib import Path
+from dotenv import load_dotenv
 import base64
 import os
+
+load_dotenv()
 
 mcp = FastMCP("Internal-AI")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# The real vault data root is an absolute, filesystem-root-level path
+# (/rationalVault/data), unrelated to wherever this script's repo checkout
+# happens to live — it is NOT BASE_DIR/rationalVault/data. Using a
+# BASE_DIR-relative path here previously caused upload_file to silently
+# write reports to the wrong location once mcp_server.py moved into the
+# hierarchy_system/ subdirectory (BASE_DIR shifted, this path didn't).
+# Override via DATA_ROOT env var if a deployment's real path differs.
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "/rationalVault/data")).resolve()
 
 def _read_file_entry(file_path: Path, relative_path: str) -> dict:
     raw = file_path.read_bytes()
@@ -60,10 +72,9 @@ def upload_file(relative_path: str, content: str) -> str:
     preserving hierarchy structure (e.g. "5/101/1/4/1/analysis_report_....md")
     so results land alongside the source files they were generated from.
     """
-    data_root = (Path(BASE_DIR) / "rationalVault" / "data").resolve()
-    target = (data_root / relative_path).resolve()
+    target = (DATA_ROOT / relative_path).resolve()
 
-    if not str(target).startswith(str(data_root)):
+    if not str(target).startswith(str(DATA_ROOT)):
         return "Rejected: path escapes data directory"
 
     if not content or len(content.strip()) == 0:

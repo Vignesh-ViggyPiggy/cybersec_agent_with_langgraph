@@ -16,7 +16,10 @@ from dotenv import load_dotenv
 from mcp_client import send_files
 from anomaly_workflow import run_anomaly_detection
 
-DEFAULT_VAULT_ROOT = "rationalVault/data"
+# Absolute path — see anomaly_workflow.py's DEFAULT_VAULT_ROOT comment. Kept
+# in sync with that one; a relative default here silently resolves against
+# mcp_server.py's own directory rather than the vault's real data root.
+DEFAULT_VAULT_ROOT = "/rationalVault/data"
 
 # Load environment variables
 load_dotenv()

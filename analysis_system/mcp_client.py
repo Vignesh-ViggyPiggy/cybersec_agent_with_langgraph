@@ -56,6 +56,19 @@ def _to_plain(obj):
     return obj
 
 
+def _unwrap_result_envelope(value):
+    """
+    Some fastmcp versions wrap a bare list/scalar return value in a
+    {"result": <value>} envelope in the wire-format JSON (observed: a tool
+    annotated to return List[dict] came back as {'result': []} instead of
+    a bare list). A real fetch_directory_files/upload_file result is never
+    itself shaped like {"result": ...}, so unwrapping this is unambiguous.
+    """
+    if isinstance(value, dict) and set(value.keys()) == {"result"}:
+        return value["result"]
+    return value
+
+
 def _extract_tool_result(result):
     """
     Pull the plain Python value out of a fastmcp CallToolResult.
@@ -73,19 +86,19 @@ def _extract_tool_result(result):
             text = getattr(block, "text", None)
             if text:
                 try:
-                    return json.loads(text)
+                    return _unwrap_result_envelope(json.loads(text))
                 except json.JSONDecodeError:
                     continue
 
     structured = getattr(result, "structured_content", None)
     if structured:
-        return _to_plain(structured)
+        return _unwrap_result_envelope(_to_plain(structured))
 
     data = getattr(result, "data", None)
     if data is not None:
-        return _to_plain(data)
+        return _unwrap_result_envelope(_to_plain(data))
 
-    return _to_plain(result)
+    return _unwrap_result_envelope(_to_plain(result))
 
 
 async def fetch_directory_files_async(root_path, toolname="fetch_directory_files"):

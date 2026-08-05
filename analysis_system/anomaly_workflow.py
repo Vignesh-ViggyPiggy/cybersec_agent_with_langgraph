@@ -42,7 +42,12 @@ for _stream in (sys.stdout, sys.stderr):
 from mcp_client import fetch_directory_files, decode_file_content
 from populate_hierarchies import populate_hierarchies as pull_hierarchy_from_vault
 
-DEFAULT_VAULT_ROOT = "rationalVault/data"
+# Absolute path — mcp_server.py's BASE_DIR is wherever it happens to be
+# running from (Path(__file__).parent), so a relative default here silently
+# resolves to the wrong location if that script ever moves (as it did during
+# the hierarchy_system/analysis_system split) or if the vault's real data
+# root isn't actually nested under wherever the server script lives.
+DEFAULT_VAULT_ROOT = "/rationalVault/data"
 CACHE_DIRNAME = ".anomaly_cache"
 
 # (remote absolute path, local subdirectory under the hierarchy folder)
