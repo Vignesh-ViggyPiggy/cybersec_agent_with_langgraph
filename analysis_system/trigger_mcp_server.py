@@ -2,7 +2,9 @@
 from fastmcp import FastMCP
 from pathlib import Path
 
-from test import _run_workflow_for_hierarchy, DEFAULT_VAULT_ROOT
+#from test import _run_workflow_for_hierarchy, DEFAULT_VAULT_ROOT
+from test_legacy_log_aggregation import _run_workflow_for_hierarchy, DEFAULT_VAULT_ROOT
+
 from mcp_client import send_files
 
 mcp = FastMCP("Analysis-Trigger")
