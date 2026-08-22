@@ -10,6 +10,7 @@ import os
 import httpx
 import json
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -31,11 +32,24 @@ load_dotenv()
 # timeout firing never crashes the workflow, just cuts a bad call short.
 MODEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "120"))
 
-model = ChatOllama(
-    model="cybersec-qwen25-3b-q4",
-    num_keep=0,
-    sync_client_kwargs={"timeout": MODEL_REQUEST_TIMEOUT_SECONDS},
-)
+# Set MODEL_NUM_GPU=0 to force pure CPU inference (zero layers offloaded to
+# GPU) for a controlled A/B test against the default GPU-assisted path. When
+# a model doesn't fully fit in VRAM, Ollama splits it across GPU+CPU, and
+# every forward pass then pays a PCIe round-trip moving activations between
+# the two on every token — that split mode can be slower than running the
+# whole model on CPU in one memory space with no cross-device copying at all.
+# Left unset, Ollama auto-decides layer placement as it always has.
+MODEL_NUM_GPU = os.getenv("MODEL_NUM_GPU")
+
+_model_kwargs = {
+    "model": os.getenv("MODEL_NAME", "cybersec-qwen25-3b-q4"),
+    "num_keep": 0,
+    "sync_client_kwargs": {"timeout": MODEL_REQUEST_TIMEOUT_SECONDS},
+}
+if MODEL_NUM_GPU is not None:
+    _model_kwargs["num_gpu"] = int(MODEL_NUM_GPU)
+
+model = ChatOllama(**_model_kwargs)
 
 
 def _load_incident_types_from_datasets() -> List[str]:
@@ -74,7 +88,34 @@ def _load_incident_types_from_datasets() -> List[str]:
     return sorted(discovered_types)
 
 
-INCIDENT_TYPES = _load_incident_types_from_datasets()
+# This workflow classifies exactly three log sources: /var/log/secure,
+# /var/log/messages, and /var/log/audit/audit.log — so the taxonomy is
+# restricted to only the incident types actually detectable from THOSE
+# sources, not the full generic dataset taxonomy. A category not reachable
+# from any of these three logs (e.g. sql_injection needs web-server/DB logs;
+# rootkit_detected needs an rkhunter/chkrootkit scan-output log, not
+# behavioral evidence; ransomware_indicator/honeypot_tamper as tested here
+# came from a separate custom application log, not auditd's narrow watch
+# rules) is excluded from the enum entirely — not discouraged in the prompt,
+# structurally impossible for the model to select — since prompt-level
+# discouragement was confirmed by testing to just redirect wrong answers
+# toward OTHER wrong categories rather than the correct one.
+ALLOWED_INCIDENT_TYPES = {
+    "user_breach",                  # /var/log/secure: failed-password cluster then accepted-password from same source
+    "privilege_escalation",         # /var/log/secure (sudo/su) or audit.log (setuid execve, capability change)
+    "ssh_key_injection",            # audit.log watching ~/.ssh/authorized_keys, or the secure session that modified it
+    "suspicious_command_execution", # audit.log watched-command syscalls (download-then-execute chains, account creation)
+    "assets_permission_tamper",     # audit.log chmod/chown syscalls on watched files
+    "file_integrity_tamper",        # audit.log watched-file modification/deletion events
+    "unknown_binary_execution",     # audit.log execve of a binary outside the known baseline
+    "log_tampering",                # /var/log/messages: rsyslog/journald/auditd service stop-restart events
+    "banned_ip",                    # /var/log/messages: firewall/fail2ban-style ban actions logged via syslog
+    "disk_full",                    # /var/log/messages: kernel "no space left on device"
+    "memory_leak",                  # /var/log/messages: OOM-killer kernel messages
+    "network_anomaly",              # /var/log/messages: kernel/network-daemon messages (weakest evidence of this group)
+}
+
+INCIDENT_TYPES = [t for t in _load_incident_types_from_datasets() if t in ALLOWED_INCIDENT_TYPES]
 INCIDENT_TYPES_SET = set(INCIDENT_TYPES)
 INCIDENT_TYPES_HINT = ", ".join(INCIDENT_TYPES)
 DEFAULT_INCIDENT_TYPE = INCIDENT_TYPES[0] if INCIDENT_TYPES else "banned_ip"
@@ -796,7 +837,23 @@ Using the existing initial analysis and logs, return:
 incident_type must be exactly one of: {INCIDENT_TYPES_WITH_FALLBACK_HINT}
 Use '{NONE_APPLICABLE_INCIDENT_TYPE}' if none of the listed types are applicable.
 secondary_incident_types must each also be one of the listed types, must never repeat the primary incident_type, and must never contain '{NONE_APPLICABLE_INCIDENT_TYPE}'.
-Ignore file-not-found style noise and focus on true security indicators.{hint_instruction}"""),
+Ignore file-not-found style noise and focus on true security indicators.
+
+Base your choice strictly on the LITERAL actions, commands, filenames, and alert
+messages that actually appear in the logs below — not on a type's name merely
+sounding thematically related or "safe" to pick when uncertain. Pick the type
+whose own definition most literally matches what these specific logs show,
+not the most generic-sounding "something is wrong" option.
+
+One pattern worth being precise about: auth/sshd-style logs showing a cluster
+of "Failed password" entries (for one or more usernames) from the same source
+address, followed by an "Accepted password" (not "Accepted publickey") success
+from that SAME address shortly after, is user_breach — that specific
+failed-then-succeeded-by-password sequence from one source IP is the
+compromise, regardless of any other routine publickey sessions, sudo
+commands, or cron jobs also present in the same log window; those surrounding
+lines are normal activity and shouldn't pull the classification toward a
+different category instead.{hint_instruction}"""),
         ("user", """Logs:
 {logs}
 
@@ -808,23 +865,24 @@ Content: {content}""")
     input_payload = {"logs": state["logs"], "title": title, "content": content}
     incident_type_chain = incident_type_template | incident_type_model
 
-    try:
-        incident_type_result = incident_type_chain.invoke(input_payload)
-        normalized = _normalize_initial_search_payload(incident_type_result.model_dump())
-        incident_type_result = InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
-    except Exception as e:
-        print(f"  ⚠ Structured output parsing failed: {e}")
-        print("  ↻ Retrying incident type classification with strict JSON fallback...")
+    def _classify_once() -> InitialSearchFromLogsToDatasetTemplate:
+        try:
+            result = incident_type_chain.invoke(input_payload)
+            normalized = _normalize_initial_search_payload(result.model_dump())
+            return InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
+        except Exception as e:
+            print(f"  ⚠ Structured output parsing failed: {e}")
+            print("  ↻ Retrying incident type classification with strict JSON fallback...")
 
-        fallback_prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""Return ONLY valid JSON with these exact keys:
+            fallback_prompt = ChatPromptTemplate.from_messages([
+                ("system", f"""Return ONLY valid JSON with these exact keys:
 - incident_type: string (must be one of: {INCIDENT_TYPES_WITH_FALLBACK_HINT})
 - secondary_incident_types: array of strings (each must also be one of the listed types; empty array if only one incident)
 
 If no listed type applies, set incident_type to '{NONE_APPLICABLE_INCIDENT_TYPE}'.
 secondary_incident_types must never repeat incident_type and must never contain '{NONE_APPLICABLE_INCIDENT_TYPE}'.
 Do not include markdown, HTML, comments, or extra text before/after JSON.{hint_instruction}"""),
-                ("user", """Analyze the following logs and initial analysis and return strict JSON now:
+                    ("user", """Analyze the following logs and initial analysis and return strict JSON now:
 
         Logs:
         {logs}
@@ -832,22 +890,60 @@ Do not include markdown, HTML, comments, or extra text before/after JSON.{hint_i
         Initial Analysis:
         Title: {title}
         Content: {content}""")
-        ])
+            ])
 
-        try:
-            raw_response = (fallback_prompt | model).invoke(input_payload)
-            raw_text = getattr(raw_response, "content", "")
-            if isinstance(raw_text, list):
-                raw_text = "\n".join(str(x) for x in raw_text)
-            raw_text = str(raw_text)
-            parsed = _extract_first_json_object(raw_text)
-        except Exception as fallback_exc:
-            print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
-            print("  ↻ Using safe defaults instead.")
-            parsed = None
+            try:
+                raw_response = (fallback_prompt | model).invoke(input_payload)
+                raw_text = getattr(raw_response, "content", "")
+                if isinstance(raw_text, list):
+                    raw_text = "\n".join(str(x) for x in raw_text)
+                raw_text = str(raw_text)
+                parsed = _extract_first_json_object(raw_text)
+            except Exception as fallback_exc:
+                print(f"  ⚠ Fallback also failed/timed out: {fallback_exc}")
+                print("  ↻ Using safe defaults instead.")
+                parsed = None
 
-        normalized = _normalize_initial_search_payload(parsed or {})
-        incident_type_result = InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
+            normalized = _normalize_initial_search_payload(parsed or {})
+            return InitialSearchFromLogsToDatasetTemplate.model_validate(normalized)
+
+    if suggested_hint:
+        # A rule-based hint is a deterministic prior, not a guess — the model
+        # reliably converges on it (that's the whole point of hint_instruction
+        # above), so a single pass is enough and voting would just burn extra
+        # calls to confirm what's already reliable.
+        incident_type_result = _classify_once()
+    else:
+        # Cold classification (no rule-based anchor) is where instability was
+        # actually observed and verified: 3 different incident_type answers to
+        # byte-identical input across separate runs. Self-consistency voting
+        # — running the same classification multiple times and taking the
+        # majority incident_type — directly targets that specific instability
+        # rather than trusting whichever answer a single sampling pass landed
+        # on. Only done in the cold-classification case since that's the only
+        # case where it's been shown to matter.
+        vote_count = max(1, int(os.getenv("CLASSIFICATION_VOTE_COUNT", "3")))
+        votes = [_classify_once() for _ in range(vote_count)]
+
+        primary_counts = Counter(v.incident_type for v in votes)
+        winning_type, _ = primary_counts.most_common(1)[0]
+        print(f"  Self-consistency vote ({vote_count} passes): "
+              f"{dict(primary_counts)} -> chose '{winning_type}'")
+
+        # Secondary types: keep any type suggested by more than half the votes
+        # among ballots that agreed with the winning primary type (a secondary
+        # type from a run that picked a different primary isn't necessarily
+        # coherent with the winning classification).
+        agreeing_votes = [v for v in votes if v.incident_type == winning_type]
+        secondary_counts = Counter(
+            sec for v in agreeing_votes for sec in v.secondary_incident_types
+        )
+        threshold = len(agreeing_votes) / 2
+        winning_secondary = [t for t, c in secondary_counts.items() if c > threshold]
+
+        incident_type_result = agreeing_votes[0].model_copy(
+            update={"incident_type": winning_type, "secondary_incident_types": winning_secondary}
+        )
 
     # The rule-based secondary hints are deterministic detection output, not a
     # guess — a small model reliably under-enumerates long lists (observed:
